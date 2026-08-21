@@ -79,7 +79,11 @@ func (s *Store) GetHolder(id string) (lease.Holder, bool, error) {
 	return h, ok, err
 }
 
-// DeleteHolder removes a holder that holds no active leases.
+// DeleteHolder removes a holder that holds no active leases and is not
+// referenced by any pending waiter. Deletion is rejected while pending waiters
+// still reference the holder: promoting such a waiter later would target a
+// holder that no longer exists. The caller must cancel or grant those waiters
+// before the holder can be removed.
 func (s *Store) DeleteHolder(id string, now time.Time) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketHolders)
@@ -95,6 +99,13 @@ func (s *Store) DeleteHolder(id string, now time.Time) error {
 		}
 		if n > 0 {
 			return lease.ErrHolderHasLeases
+		}
+		pending, err := countPendingWaitersByHolder(tx, id)
+		if err != nil {
+			return err
+		}
+		if pending > 0 {
+			return lease.ErrHolderHasWaiters
 		}
 		return b.Delete([]byte(id))
 	})
