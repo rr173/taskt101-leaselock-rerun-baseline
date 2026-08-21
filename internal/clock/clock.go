@@ -37,6 +37,8 @@ func NewFakeClock(at time.Time) *FakeClock {
 
 // Now returns the clock's current instant.
 func (f *FakeClock) Now() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.now
 }
 
