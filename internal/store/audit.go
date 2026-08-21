@@ -96,6 +96,9 @@ func (s *Store) TokenHistory(resource string) ([]lease.AuditEntry, error) {
 			if !issuance[p.Action] {
 				continue
 			}
+			if resource != "" && p.Resource != resource {
+				continue
+			}
 			out = append(out, fromPersistedAudit(p))
 		}
 		sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
