@@ -128,6 +128,13 @@ func enforceQuota(tx *bbolt.Tx, holder string, now time.Time, add int) error {
 // It returns the granted token (0 if no waiter was promoted). Called inside
 // the releasing transaction so the promotion commits atomically with the
 // release/reap.
+//
+// The waiter is only promoted if its holder still has concurrency headroom
+// (MaxConcurrent). A waiter whose holder is at the cap is left pending and the
+// resource stays free — the release/expiry that triggered the promotion still
+// succeeds. We do not skip an over-quota waiter to serve a later one: that would
+// break FIFO ordering, so the head waiter stays pending until its holder has
+// headroom again.
 func promoteWaiterFor(tx *bbolt.Tx, resource string, now time.Time) (lease.Token, error) {
 	w, ok, err := oldestPendingWaiter(tx, resource)
 	if err != nil {
@@ -135,6 +142,15 @@ func promoteWaiterFor(tx *bbolt.Tx, resource string, now time.Time) (lease.Token
 	}
 	if !ok {
 		return 0, nil
+	}
+	// A promotion grants one new active lease to the waiter's holder. If that
+	// would exceed the holder's cap, leave the waiter pending and the resource
+	// free rather than breaking the concurrency quota.
+	if err := enforceQuota(tx, w.Holder, now, 1); err != nil {
+		if errors.Is(err, lease.ErrQuotaExceeded) {
+			return 0, nil
+		}
+		return 0, err
 	}
 	token, err := allocToken(tx)
 	if err != nil {
