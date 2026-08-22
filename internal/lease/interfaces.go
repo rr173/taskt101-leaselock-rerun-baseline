@@ -7,6 +7,12 @@ import "time"
 // promotion, and the audit append all commit together, so a crash mid-op
 // leaves neither partial state nor a dangling audit record.
 type LeaseStore interface {
+	// Acquire grants a fresh lease. If the resource is actively held it
+	// returns ErrHeld. If the lease is expired but pending waiters already
+	// queue for the resource, FIFO is honored: the oldest waiter is promoted
+	// (same transaction), the caller is appended to the queue tail, and
+	// ErrQueued is returned with no lease. Otherwise the caller receives a
+	// fresh lease with a strictly larger fencing token.
 	Acquire(resource, holder string, now time.Time, ttl time.Duration) (Lease, error)
 	Renew(resource, holder string, token Token, now time.Time, ttl time.Duration) (Lease, error)
 	Release(resource, holder string, token Token, now time.Time) error

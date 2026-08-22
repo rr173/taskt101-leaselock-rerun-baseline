@@ -147,6 +147,36 @@ func countPendingWaitersByHolder(tx *bbolt.Tx, holder string) (int, error) {
 	return count, nil
 }
 
+// hasPendingWaiter reports whether the resource has at least one pending
+// waiter. It reuses oldestPendingWaiter so the FIFO promotion path and this
+// check stay consistent.
+func hasPendingWaiter(tx *bbolt.Tx, resource string) (bool, error) {
+	_, ok, err := oldestPendingWaiter(tx, resource)
+	if err != nil {
+		return false, err
+	}
+	return ok, nil
+}
+
+// enqueuePendingWaiter allocates a waiter seq, assigns a fresh id, and
+// persists a pending waiter for resource/holder/ttl. The caller holds the
+// write transaction; nothing else is mutated. Used by both EnqueueWaiter and
+// Acquire's queue-tail path so the enqueue logic does not drift between them.
+func enqueuePendingWaiter(tx *bbolt.Tx, resource, holder string, ttl time.Duration, now time.Time) (lease.Waiter, error) {
+	seq, err := nextWaiterSeq(tx)
+	if err != nil {
+		return lease.Waiter{}, err
+	}
+	w := lease.Waiter{
+		ID: newWaiterID(seq), Resource: resource, Holder: holder, TTLSeconds: int64(ttl / time.Second),
+		CreatedAt: now, Status: lease.WaiterPending,
+	}
+	if err := putWaiter(tx, w); err != nil {
+		return lease.Waiter{}, err
+	}
+	return w, nil
+}
+
 // EnqueueWaiter grants a lease immediately if the resource is free; otherwise
 // queues a pending waiter.
 func (s *Store) EnqueueWaiter(resource, holder string, ttl time.Duration, now time.Time) (lease.Waiter, error) {
@@ -185,16 +215,9 @@ func (s *Store) EnqueueWaiter(resource, holder string, ttl time.Duration, now ti
 			}
 			return putWaiter(tx, w)
 		}
-		// Resource held: queue a pending waiter.
-		seq, err := nextWaiterSeq(tx)
-		if err != nil {
-			return err
-		}
-		w = lease.Waiter{
-			ID: newWaiterID(seq), Resource: resource, Holder: holder, TTLSeconds: int64(ttl / time.Second),
-			CreatedAt: now, Status: lease.WaiterPending,
-		}
-		return putWaiter(tx, w)
+		// Resource held: queue a pending waiter at the tail.
+		w, err = enqueuePendingWaiter(tx, resource, holder, ttl, now)
+		return err
 	})
 	if err != nil {
 		return lease.Waiter{}, err

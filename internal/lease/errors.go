@@ -12,6 +12,12 @@ var (
 	// ErrHeld: the resource already has an active lease. HTTP 409.
 	ErrHeld = errors.New("resource held")
 
+	// ErrQueued: Acquire found the resource's lease expired but pending waiters
+	// already queued for it. Per FIFO, the oldest waiter is promoted and the
+	// new request is appended to the queue tail instead of being granted a
+	// lease. HTTP 422. The caller did not receive a lease.
+	ErrQueued = errors.New("queued")
+
 	// ErrNotHeld: the resource has no lease record. HTTP 404.
 	ErrNotHeld = errors.New("not held")
 

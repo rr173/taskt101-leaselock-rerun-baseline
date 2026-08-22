@@ -163,9 +163,29 @@ func promoteWaiterFor(tx *bbolt.Tx, resource string, now time.Time) (lease.Token
 	return token, nil
 }
 
-// Acquire grants a fresh lease atomically.
+// reapExpiredLease records the expire audit and deletes the (expired) lease.
+// The caller has already established that l is not active at now. Called
+// inside the mutating transaction so the reap commits atomically with the
+// surrounding work.
+func reapExpiredLease(tx *bbolt.Tx, l lease.Lease, now time.Time) error {
+	if err := appendAudit(tx, now, lease.ActionExpire, l.Resource, l.Holder, l.Token, "reaped"); err != nil {
+		return err
+	}
+	return deleteLease(tx, l.Resource)
+}
+
+// Acquire grants a fresh lease atomically. An expired lease is reaped first.
+// Per FIFO, if the expired resource has pending waiters, the oldest one is
+// promoted (in this same transaction) and the caller's request is appended to
+// the queue tail instead of being granted; in that case Acquire returns
+// ErrQueued and no lease. Only when the resource is genuinely free (no active
+// lease, no pending waiters) is the caller granted a fresh lease with a token
+// strictly larger than any previously issued.
 func (s *Store) Acquire(resource, holder string, now time.Time, ttl time.Duration) (lease.Lease, error) {
-	var granted lease.Lease
+	var (
+		granted lease.Lease
+		queued  bool
+	)
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		existing, exists, err := readLease(tx, resource)
 		if err != nil {
@@ -173,6 +193,34 @@ func (s *Store) Acquire(resource, holder string, now time.Time, ttl time.Duratio
 		}
 		if exists && existing.Active(now) {
 			return lease.ErrHeld
+		}
+		// Expired (or absent) lease. Before granting to the caller, honor the
+		// FIFO queue: if waiters are already pending, promote the oldest and
+		// send the caller to the tail instead of cutting in line. This must
+		// commit (return nil) so the promotion+enqueue persist; the caller is
+		// told it was queued via the `queued` flag after the transaction.
+		if exists {
+			waiting, err := hasPendingWaiter(tx, resource)
+			if err != nil {
+				return err
+			}
+			if waiting {
+				if err := reapExpiredLease(tx, existing, now); err != nil {
+					return err
+				}
+				if _, err := promoteWaiterFor(tx, resource, now); err != nil {
+					return err
+				}
+				if _, err := enqueuePendingWaiter(tx, resource, holder, ttl, now); err != nil {
+					return err
+				}
+				queued = true
+				return nil
+			}
+			// No waiters: reap the stale lease so the fresh grant below replaces it.
+			if err := reapExpiredLease(tx, existing, now); err != nil {
+				return err
+			}
 		}
 		if err := enforceQuota(tx, holder, now, 1); err != nil {
 			return err
@@ -192,6 +240,9 @@ func (s *Store) Acquire(resource, holder string, now time.Time, ttl time.Duratio
 	})
 	if err != nil {
 		return lease.Lease{}, err
+	}
+	if queued {
+		return lease.Lease{}, lease.ErrQueued
 	}
 	return granted, nil
 }
@@ -289,10 +340,14 @@ func (s *Store) Transfer(resource, holder string, token lease.Token, newHolder s
 }
 
 // BulkAcquire acquires leases on every resource atomically (all-or-nothing).
+// It grants immediately and never queues; therefore a resource whose lease is
+// expired but which already has pending waiters cannot be granted (it would
+// cut in line), so the whole batch rolls back with ErrConflict.
 func (s *Store) BulkAcquire(holder string, resources []string, now time.Time, ttl time.Duration) ([]lease.Lease, error) {
 	granted := make([]lease.Lease, 0, len(resources))
 	err := s.db.Update(func(tx *bbolt.Tx) error {
-		// Pre-check: none held active, and holder quota covers the whole batch.
+		// Pre-check: none held active, none expired-with-waiters (FIFO), and
+		// holder quota covers the whole batch.
 		for _, r := range resources {
 			existing, exists, err := readLease(tx, r)
 			if err != nil {
@@ -301,11 +356,33 @@ func (s *Store) BulkAcquire(holder string, resources []string, now time.Time, tt
 			if exists && existing.Active(now) {
 				return lease.ErrConflict
 			}
+			if exists {
+				// Expired lease: if waiters are already queued, a fresh grant
+				// would bypass FIFO, so the bulk (all-or-nothing) must abort.
+				waiting, err := hasPendingWaiter(tx, r)
+				if err != nil {
+					return err
+				}
+				if waiting {
+					return lease.ErrConflict
+				}
+			}
 		}
 		if err := enforceQuota(tx, holder, now, len(resources)); err != nil {
 			return err
 		}
 		for _, r := range resources {
+			existing, exists, err := readLease(tx, r)
+			if err != nil {
+				return err
+			}
+			if exists {
+				// Established non-active and waiter-free in the pre-check;
+				// reap so the fresh grant replaces the stale record.
+				if err := reapExpiredLease(tx, existing, now); err != nil {
+					return err
+				}
+			}
 			token, err := allocToken(tx)
 			if err != nil {
 				return err
@@ -436,10 +513,7 @@ func (s *Store) ExpireAll(now time.Time) (int, error) {
 			if !l.Active(now) {
 				key := make([]byte, len(k))
 				copy(key, k)
-				if err := appendAudit(tx, now, lease.ActionExpire, l.Resource, l.Holder, l.Token, "reaped"); err != nil {
-					return err
-				}
-				if err := b.Delete(key); err != nil {
+				if err := reapExpiredLease(tx, l, now); err != nil {
 					return err
 				}
 				reapedResources = append(reapedResources, l.Resource)

@@ -94,6 +94,88 @@ func TestWaiterFIFOOrder(t *testing.T) {
 	}
 }
 
+// TestAcquireExpiredWithWaiterQueuesCallerAndPromotesOldest: when a lease
+// expires while waiters are pending, a fresh Acquire must NOT cut in line.
+// The oldest waiter is promoted (FIFO) and the caller is appended to the tail
+// (ErrQueued, no lease granted to the caller).
+func TestAcquireExpiredWithWaiterQueuesCallerAndPromotesOldest(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+	t0 := time.Unix(100, 0)
+	l1, _ := s.Acquire("X", "H1", t0, 5*time.Second) // deadline 105
+	wA, _ := s.EnqueueWaiter("X", "HA", 5*time.Second, t0.Add(1*time.Second))
+	wB, _ := s.EnqueueWaiter("X", "HB", 5*time.Second, t0.Add(2*time.Second))
+	if wA.Status != lease.WaiterPending || wB.Status != lease.WaiterPending {
+		t.Fatalf("setup waiters = %v %v want pending", wA.Status, wB.Status)
+	}
+	later := t0.Add(6 * time.Second) // X expired
+	// Fresh Acquire from HZ while HA/HB are queued: must be queued, not granted.
+	_, err := s.Acquire("X", "HZ", later, 5*time.Second)
+	if !errors.Is(err, lease.ErrQueued) {
+		t.Fatalf("Acquire with queued waiters = %v want ErrQueued", err)
+	}
+	// HA (oldest) was promoted to holder with a strictly larger token.
+	got, active, ok := s.Inspect("X", later)
+	if !ok || !active || got.Holder != "HA" || got.Token <= l1.Token {
+		t.Fatalf("after expired Acquire X = %+v active=%v want HA token>%d", got, active, l1.Token)
+	}
+	// The caller HZ is now a pending waiter at the tail, behind HB.
+	pending, _ := s.ListWaiters("X", lease.WaiterPending)
+	if len(pending) != 2 {
+		t.Fatalf("pending waiters = %d want 2 (HB then HZ)", len(pending))
+	}
+	if pending[0].Holder != "HB" || pending[1].Holder != "HZ" {
+		t.Fatalf("pending order = %s %s want HB then HZ", pending[0].Holder, pending[1].Holder)
+	}
+}
+
+// TestAcquireExpiredNoWaiterGrants: with no queued waiters, an expired lease
+// is reaped and replaced with a fresh grant carrying a strictly larger token
+// (the pre-fix behavior is preserved when the queue is empty).
+func TestAcquireExpiredNoWaiterGrants(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+	now := time.Unix(100, 0)
+	l1, _ := s.Acquire("X", "H1", now, 5*time.Second)
+	later := now.Add(6 * time.Second)
+	l2, err := s.Acquire("X", "H2", later, 5*time.Second)
+	if err != nil {
+		t.Fatalf("re-Acquire expired no-waiter: %v", err)
+	}
+	if l2.Token <= l1.Token {
+		t.Fatalf("re-acquire token %d not > %d", l2.Token, l1.Token)
+	}
+}
+
+// TestBulkAcquireExpiredWithWaiterConflicts: BulkAcquire is all-or-nothing and
+// never queues, so a resource whose lease expired while waiters are pending
+// causes the whole batch to roll back with ErrConflict rather than cutting in
+// line.
+func TestBulkAcquireExpiredWithWaiterConflicts(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+	t0 := time.Unix(100, 0)
+	s.Acquire("Y", "H1", t0, 5*time.Second) // Y expires at 105
+	s.EnqueueWaiter("Y", "HA", 5*time.Second, t0.Add(1*time.Second))
+	later := t0.Add(6 * time.Second) // Y expired, HA pending
+	_, err := s.BulkAcquire("H2", []string{"X", "Y", "Z"}, later, 5*time.Second)
+	if !errors.Is(err, lease.ErrConflict) {
+		t.Fatalf("BulkAcquire over expired-with-waiter = %v want ErrConflict", err)
+	}
+	// Nothing granted: X and Z do not exist; Y still has its expired record
+	// (no reap, no grant) and HA remains pending.
+	if _, _, ok := s.Inspect("X", later); ok {
+		t.Fatalf("X should not exist after failed bulk")
+	}
+	if _, _, ok := s.Inspect("Z", later); ok {
+		t.Fatalf("Z should not exist after failed bulk")
+	}
+	ws, _ := s.ListWaiters("Y", lease.WaiterPending)
+	if len(ws) != 1 || ws[0].Holder != "HA" {
+		t.Fatalf("HA pending = %+v want 1 HA pending", ws)
+	}
+}
+
 // TestCancelWaiterNotPromoted: a cancelled waiter is skipped on promotion.
 func TestCancelWaiterNotPromoted(t *testing.T) {
 	s, _ := newTestStore(t)

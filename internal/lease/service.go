@@ -63,8 +63,11 @@ func validateTTL(ttl int64) error {
 	return nil
 }
 
-// Acquire grants a new lease. An expired lease is reaped and replaced with a
-// fresh one carrying a strictly larger token.
+// Acquire grants a new lease. An actively held resource returns ErrHeld. An
+// expired lease is reaped first; if pending waiters already queue for it, FIFO
+// is honored (oldest waiter promoted, this request queued at the tail) and
+// ErrQueued is returned with no lease. Otherwise the caller receives a fresh
+// lease carrying a strictly larger token.
 func (s *Service) Acquire(resource, holder string, ttlSeconds int64, policy string) (Lease, error) {
 	if err := validateResourceHolder(resource, holder); err != nil {
 		return Lease{}, err

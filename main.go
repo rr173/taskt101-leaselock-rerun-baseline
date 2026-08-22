@@ -234,6 +234,8 @@ func statusFor(err error) (int, string) {
 		return http.StatusBadRequest, err.Error()
 	case errors.Is(err, lease.ErrHeld):
 		return http.StatusConflict, "resource held"
+	case errors.Is(err, lease.ErrQueued):
+		return http.StatusUnprocessableEntity, "queued"
 	case errors.Is(err, lease.ErrNotHeld):
 		return http.StatusNotFound, "not held"
 	case errors.Is(err, lease.ErrNotHolder):
