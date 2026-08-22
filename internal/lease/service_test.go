@@ -143,6 +143,35 @@ func TestServiceValidationErrors(t *testing.T) {
 	}
 }
 
+func TestServiceBulkReleaseRejectsEmptyAndDuplicate(t *testing.T) {
+	clk := clock.NewFakeClock(time.Unix(100, 0))
+	svc, closeFn := newServiceOverRealStore(t, clk)
+	defer closeFn()
+
+	// Empty resource entry.
+	if _, err := svc.BulkRelease("H", []lease.ReleaseEntry{
+		{Resource: "A", Token: 1},
+		{Resource: "", Token: 2},
+	}); !lease.IsInvalid(err) {
+		t.Fatalf("empty resource bulk release = %v want ErrInvalid", err)
+	}
+	// Duplicate resource entry.
+	if _, err := svc.BulkRelease("H", []lease.ReleaseEntry{
+		{Resource: "A", Token: 1},
+		{Resource: "A", Token: 1},
+	}); !lease.IsInvalid(err) {
+		t.Fatalf("duplicate resource bulk release = %v want ErrInvalid", err)
+	}
+	// Invalid request must not write any audit record.
+	entries, err := svc.ListAudit("A", 100, 0)
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("audit = %d entries, want 0 (no release written for invalid bulk)", len(entries))
+	}
+}
+
 func TestServiceStatsAndAudit(t *testing.T) {
 	clk := clock.NewFakeClock(time.Unix(100, 0))
 	svc, closeFn := newServiceOverRealStore(t, clk)

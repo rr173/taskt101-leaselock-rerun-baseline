@@ -136,7 +136,9 @@ func (s *Service) BulkAcquire(holder string, resources []string, ttlSeconds int6
 	return s.store.BulkAcquire(holder, resources, s.clk.Now(), time.Duration(ttlSeconds)*time.Second)
 }
 
-// BulkRelease releases multiple leases atomically (all-or-nothing).
+// BulkRelease releases multiple leases atomically (all-or-nothing). Empty or
+// duplicate resources are rejected up front as invalid requests so the store
+// never writes a release audit record for a redundant or empty entry.
 func (s *Service) BulkRelease(holder string, entries []ReleaseEntry) (int, error) {
 	if holder == "" {
 		return 0, fmt.Errorf("%w: holder must not be empty", ErrInvalid)
@@ -146,6 +148,16 @@ func (s *Service) BulkRelease(holder string, entries []ReleaseEntry) (int, error
 	}
 	if len(entries) > MaxBulkSize {
 		return 0, fmt.Errorf("%w: bulk size exceeds %d", ErrInvalid, MaxBulkSize)
+	}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		if e.Resource == "" {
+			return 0, fmt.Errorf("%w: resource must not be empty", ErrInvalid)
+		}
+		if seen[e.Resource] {
+			return 0, fmt.Errorf("%w: duplicate resource %q in bulk", ErrInvalid, e.Resource)
+		}
+		seen[e.Resource] = true
 	}
 	return s.store.BulkRelease(holder, entries, s.clk.Now())
 }
